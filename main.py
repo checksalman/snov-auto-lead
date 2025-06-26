@@ -7,9 +7,9 @@ import os
 app = FastAPI()
 
 # Read these from Render environment variables for security
-CLIENT_ID = os.getenv("CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
-TARGET_LIST_ID = os.getenv("TARGET_LIST_ID", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "51f27d5e53af0dd3f31c3f254ef8faac")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "bc650b8ec6f50cec75385a429044e307")
+TARGET_LIST_ID = os.getenv("TARGET_LIST_ID", "31583921")
 
 ACCESS_TOKEN = None
 
