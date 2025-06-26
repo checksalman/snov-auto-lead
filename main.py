@@ -37,8 +37,7 @@ async def get_access_token():
         return ACCESS_TOKEN
 
 async def start_domain_search(domain):
-    if not ACCESS_TOKEN:
-        await get_access_token()
+    await get_access_token()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.snov.io/v2/domain-search/start",
@@ -57,26 +56,62 @@ async def start_domain_search(domain):
         print("Domain search started. Task hash:", task_hash)
         return task_hash
 
-async def poll_results(task_hash):
+async def poll_domain_search_result(task_hash):
     async with httpx.AsyncClient() as client:
-        for attempt in range(20):  # Increased attempts
+        for attempt in range(20):
             resp = await client.get(
                 f"https://api.snov.io/v2/domain-search/result/{task_hash}",
                 headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
             )
             if resp.status_code != 200:
-                print("Polling failed:", resp.text)
-                raise HTTPException(status_code=500, detail="Polling failed")
+                print("Polling domain search failed:", resp.text)
+                raise HTTPException(status_code=500, detail="Polling domain search failed")
+            
+            data = resp.json()
+            if data.get("status") == "completed":
+                print(f"Domain search completed after {attempt+1} attempts.")
+                return data
+            print(f"Domain search poll {attempt+1}/20: not ready yet")
+            await asyncio.sleep(5)
+    raise HTTPException(status_code=504, detail="Domain search polling timed out")
+
+async def start_prospect_search(prospects_url):
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            prospects_url,
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        )
+        if resp.status_code not in [200, 202]:
+            print(f"Prospect search start failed [{resp.status_code}]:", resp.text)
+            raise HTTPException(status_code=500, detail="Prospect search start failed")
+        
+        task_hash = resp.json().get("task_hash")
+        if not task_hash:
+            print("No task_hash for prospect search:", resp.text)
+            raise HTTPException(status_code=500, detail="No task_hash for prospect search")
+        
+        print("Prospect search started. Task hash:", task_hash)
+        return task_hash
+
+async def poll_prospect_result(task_hash):
+    async with httpx.AsyncClient() as client:
+        for attempt in range(20):
+            resp = await client.get(
+                f"https://api.snov.io/v2/domain-search/prospects/result/{task_hash}",
+                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
+            )
+            if resp.status_code != 200:
+                print("Polling prospect result failed:", resp.text)
+                raise HTTPException(status_code=500, detail="Polling prospect result failed")
             
             data = resp.json()
             if data.get("status") == "processed":
-                print(f"Results ready after {attempt+1} attempts.")
+                print(f"Prospect search processed after {attempt+1} attempts.")
                 return data.get("prospects", [])
             
-            print(f"Polling {attempt+1}/20: not ready yet")
-            print(f"Polling response: {resp.text}")
-            await asyncio.sleep(5)  # wait 5 seconds before next poll
-    raise HTTPException(status_code=504, detail="Polling timed out")
+            print(f"Prospect poll {attempt+1}/20: not ready yet")
+            await asyncio.sleep(5)
+    raise HTTPException(status_code=504, detail="Prospect polling timed out")
 
 async def add_prospect(prospect):
     async with httpx.AsyncClient() as client:
@@ -96,10 +131,20 @@ async def add_prospect(prospect):
 
 @app.post("/find-buyers")
 async def find_buyers(req: CompanyRequest):
-    task_hash = await start_domain_search(req.domain)
-    prospects = await poll_results(task_hash)
+    # Phase 1: domain search
+    domain_task = await start_domain_search(req.domain)
+    domain_data = await poll_domain_search_result(domain_task)
+    
+    prospects_url = domain_data.get("links", {}).get("prospects")
+    if not prospects_url:
+        raise HTTPException(status_code=500, detail="No prospects URL returned from domain search")
+    
+    # Phase 2: start and poll prospects
+    prospect_task = await start_prospect_search(prospects_url)
+    prospects = await poll_prospect_result(prospect_task)
     print(f"Total prospects found: {len(prospects)}")
 
+    # Phase 3: filter + add
     filtered = [
         p for p in prospects
         if p.get("position") and any(
