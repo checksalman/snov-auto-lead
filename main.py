@@ -45,7 +45,7 @@ async def start_domain_search(domain):
             json={"domain": domain},
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
         )
-        if resp.status_code != 200:
+        if resp.status_code not in [200, 202]:
             print(f"Domain search request failed [{resp.status_code}]:", resp.text)
             raise HTTPException(status_code=500, detail="Domain search request failed")
 
