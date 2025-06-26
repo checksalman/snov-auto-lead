@@ -1,188 +1,259 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import httpx
+import logging
 import asyncio
+import httpx
+import re
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel
 
-app = FastAPI()
-
+# Snov.io API credentials and target list ID
+# IMPORTANT: In a production environment, consider using environment variables for sensitive data.
 CLIENT_ID = "6738400dc1c082262546a8f7a8b76601"
 CLIENT_SECRET = "cd413b651eda5fb2ee2bc82036313713"
 TARGET_LIST_ID = "31583921"
-ACCESS_TOKEN = None
 
-class CompanyRequest(BaseModel):
+# Keywords for prospect positions (case-insensitive and with word boundaries for accuracy)
+TARGET_KEYWORDS = [
+    "buyer", "purchase", "ceo", "managing director", "procure", "procurement"
+]
+
+# Configure logging for detailed output during execution
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI application
+app = FastAPI(
+    title="Snov.io Prospect Automation",
+    description="API to find and add prospects from a given domain to a Snov.io list.",
+    version="1.0.0"
+)
+
+# Global dictionary to store the Snov.io access token and its expiry time.
+# This helps in caching the token and avoiding re-authentication on every request.
+snov_access_token = {
+    "token": None,
+    "expires_at": 0 # Unix timestamp
+}
+
+# Base URLs for Snov.io API endpoints
+SNOV_API_BASE_URL = "https://api.snov.io/v1"
+OAUTH_TOKEN_URL = "https://api.snov.io/v1/oauth/access_token"
+
+class DomainRequest(BaseModel):
+    """
+    Pydantic model for validating the incoming request body.
+    Ensures that the 'domain' field is provided.
+    """
     domain: str
 
-async def get_access_token():
-    global ACCESS_TOKEN
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.snov.io/v1/oauth/access_token",
-            data={
-                "grant_type": "client_credentials",
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET
-            }
-        )
-        if resp.status_code != 200:
-            print("❌ Auth failed:", resp.text)
-            raise HTTPException(status_code=500, detail="Snov.io auth failed")
-        ACCESS_TOKEN = resp.json().get("access_token")
-        if not ACCESS_TOKEN:
-            print("❌ No access token in response:", resp.text)
-            raise HTTPException(status_code=500, detail="Access token missing")
-        print("✅ Access token received.")
-        return ACCESS_TOKEN
+async def get_snov_access_token():
+    """
+    Obtains or refreshes the Snov.io API access token.
+    Tokens are cached and refreshed if they are nearing expiry.
+    """
+    # Use event loop time for consistency within the async application
+    current_time = asyncio.get_event_loop().time()
 
-async def start_domain_search(domain):
-    print(f"🔹 Starting domain search for: {domain}")
-    await get_access_token()
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.snov.io/v2/domain-search/start",
-            json={"domain": domain},
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        )
-        if resp.status_code not in [200, 202]:
-            print("❌ Domain search failed:", resp.text)
-            raise HTTPException(status_code=500, detail="Domain search failed")
-        task_hash = resp.json().get("meta", {}).get("task_hash")
-        print(f"✅ Domain search task hash: {task_hash}")
-        return task_hash
+    # Check if the cached token is still valid (with a buffer of 60 seconds)
+    if snov_access_token["token"] and snov_access_token["expires_at"] > current_time + 60:
+        logger.info("Using cached Snov.io access token.")
+        return snov_access_token["token"]
 
-async def poll_domain_result(task_hash):
-    async with httpx.AsyncClient() as client:
-        for attempt in range(20):
-            resp = await client.get(
-                f"https://api.snov.io/v2/domain-search/result/{task_hash}",
-                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    logger.info("Attempting to obtain a new Snov.io access token...")
+    try:
+        async with httpx.AsyncClient() as client:
+            # Make a POST request to the OAuth token endpoint
+            response = await client.post(
+                OAUTH_TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET
+                }
             )
-            if resp.status_code != 200:
-                raise HTTPException(status_code=500, detail="Polling domain result failed")
-            data = resp.json()
-            print(f"🔄 Domain poll {attempt+1}: status={data.get('status')}")
-            if data.get("status") == "completed":
-                print(f"✅ Domain search completed: Meta={data.get('meta')}")
-                print(f"🌐 Links: {data.get('links')}")
-                return data
-            await asyncio.sleep(5)
-    raise HTTPException(status_code=504, detail="Domain polling timed out")
+            response.raise_for_status() # Raise an exception for 4xx/5xx status codes
+            token_data = response.json()
 
-async def start_prospect_search(prospect_url):
-    print(f"🔹 Starting prospect search at URL: {prospect_url}")
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            prospect_url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        )
-        if resp.status_code not in [200, 202]:
-            print("❌ Prospect search failed:", resp.text)
-            return None
-        task_hash = resp.json().get("meta", {}).get("task_hash")
-        print(f"✅ Prospect search task hash: {task_hash}")
-        return task_hash
+            if "access_token" in token_data:
+                # Store the new token and calculate its expiry time
+                snov_access_token["token"] = token_data["access_token"]
+                # Reduce expiry by 120 seconds to pre-emptively refresh
+                snov_access_token["expires_at"] = current_time + token_data.get("expires_in", 3600) - 120
+                logger.info("Successfully obtained new Snov.io access token.")
+                return snov_access_token["token"]
+            else:
+                # Log error if access_token is not in the response
+                logger.error(f"Failed to get access token: {token_data.get('message', 'Unknown error')}")
+                raise HTTPException(status_code=500, detail="Failed to obtain Snov.io access token.")
+    except httpx.HTTPStatusError as e:
+        # Handle HTTP status errors (e.g., 401, 403, 500 from Snov.io)
+        logger.error(f"HTTP error getting Snov.io token: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=500, detail=f"Snov.io token HTTP error: {e.response.text}")
+    except httpx.RequestError as e:
+        # Handle network-related errors (e.g., DNS resolution, connection refused)
+        logger.error(f"Network error getting Snov.io token: {e}")
+        raise HTTPException(status_code=500, detail=f"Snov.io token network error: {e}")
+    except Exception as e:
+        # Catch any other unexpected errors during token retrieval
+        logger.error(f"Unexpected error getting Snov.io token: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error obtaining Snov.io access token: {e}")
 
-async def poll_prospect_result(task_hash):
-    if not task_hash:
-        print("⚠️ No task hash provided for prospect polling.")
-        return []
-    async with httpx.AsyncClient() as client:
-        for attempt in range(20):
-            resp = await client.get(
-                f"https://api.snov.io/v2/domain-search/prospects/result/{task_hash}",
-                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
+async def call_snov_api(endpoint: str, data: dict):
+    """
+    Helper function to make authenticated POST requests to Snov.io API endpoints.
+    Automatically adds the access token and handles common API error responses.
+    """
+    access_token = await get_snov_access_token()
+    data["access_token"] = access_token # Add the access token to the request payload
+    full_url = f"{SNOV_API_BASE_URL}/{endpoint}"
+    logger.debug(f"Calling Snov.io API: {full_url} with data: {data}")
+
+    try:
+        # Use httpx.AsyncClient with a timeout to prevent indefinite waits
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(full_url, data=data)
+            response.raise_for_status() # Raise an exception for 4xx/5xx responses
+
+            result = response.json()
+
+            # Snov.io API typically indicates errors with "success": false
+            if isinstance(result, dict) and result.get("success") is False:
+                error_message = result.get("message", "Unknown Snov.io API error.")
+                logger.error(f"Snov.io API call failed for {endpoint}: {error_message}")
+                raise HTTPException(status_code=400, detail=f"Snov.io API error: {error_message}")
+            return result
+    except httpx.HTTPStatusError as e:
+        # Handle HTTP status errors from Snov.io API calls
+        logger.error(f"HTTP error during Snov.io API call to {endpoint}: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"Snov.io API HTTP error: {e.response.text}")
+    except httpx.RequestError as e:
+        # Handle network errors during API calls
+        logger.error(f"Network error during Snov.io API call to {endpoint}: {e}")
+        raise HTTPException(status_code=500, detail=f"Snov.io API network error: {e}")
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger.error(f"Unexpected error during Snov.io API call to {endpoint}: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error during Snov.io API call: {e}")
+
+@app.post("/process-domain-prospects")
+async def process_domain_prospects(domain_request: DomainRequest):
+    """
+    API endpoint to process a given domain, find relevant prospects,
+    and add them to a predefined Snov.io list.
+
+    Args:
+        domain_request (DomainRequest): Pydantic model containing the domain URL.
+
+    Returns:
+        dict: A summary of the operation, including the number of prospects checked
+              and the number of prospects added to the list.
+    """
+    domain = domain_request.domain
+    logger.info(f"Received request to process domain: {domain}")
+
+    checked_prospects_count = 0
+    added_prospects_count = 0
+
+    try:
+        # 1. Start and Poll domain search via Snov API's 'domain-search' endpoint.
+        # Snov.io's 'domain-search' API might return 'processing' status,
+        # requiring repeated calls until 'done'.
+        logger.info(f"Initiating domain search for {domain}...")
+        domain_search_result = {}
+        status = "processing"
+        polling_attempts = 0
+        MAX_POLLING_ATTEMPTS = 30 # Maximum number of times to poll
+        POLLING_DELAY = 5 # Seconds to wait between polling attempts
+
+        while status == "processing" and polling_attempts < MAX_POLLING_ATTEMPTS:
+            domain_search_result = await call_snov_api(
+                "domain-search",
+                {"domain": domain}
             )
-            if resp.status_code != 200:
-                print("❌ Polling prospect result failed:", resp.text)
-                return []
-            data = resp.json()
-            print(f"🔄 Prospect poll {attempt+1}: status={data.get('status')}")
-            if data.get("status") == "completed":
-                prospects = data.get("prospects", [])
-                print(f"✅ Prospects retrieved: {len(prospects)}")
-                return prospects
-            await asyncio.sleep(5)
-    print("⚠️ Prospect polling timed out.")
-    return []
+            status = domain_search_result.get("status", "error")
+            logger.info(f"Domain search status for {domain}: {status} (Attempt {polling_attempts + 1}/{MAX_POLLING_ATTEMPTS})")
 
-async def fetch_emails_for_prospect(search_email_url):
-    if not search_email_url:
-        print("⚠️ No search email URL provided.")
-        return None
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            search_email_url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        )
-        if resp.status_code not in [200, 202]:
-            print("❌ Email search start failed:", resp.text)
-            return None
-        task_hash = resp.json().get("task_hash")
-        for attempt in range(10):
-            result_resp = await client.get(
-                f"https://api.snov.io/v2/domain-search/prospects/search-emails/result/{task_hash}",
-                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
-            )
-            if result_resp.status_code != 200:
-                print("❌ Email search result failed:", result_resp.text)
-                return None
-            data = result_resp.json()
-            if data.get("status") == "completed":
-                emails = data.get("emails", [])
-                if emails:
-                    print(f"✅ Email found: {emails[0].get('email')}")
-                    return emails[0].get("email")
-                else:
-                    print("⚠️ No email found.")
-                    return None
-            await asyncio.sleep(3)
-        print("⚠️ Email search timed out.")
-        return None
+            if status == "processing":
+                polling_attempts += 1
+                logger.info(f"Waiting {POLLING_DELAY} seconds before next poll...")
+                await asyncio.sleep(POLLING_DELAY)
+            elif status == "error":
+                # If Snov.io returns an 'error' status for the search
+                error_message = domain_search_result.get("message", "Unknown error during domain search.")
+                raise HTTPException(status_code=500, detail=f"Snov.io domain search returned an error for {domain}: {error_message}")
+            elif status == "done":
+                # Search is complete, break the loop
+                break
+        
+        # If the loop finishes but status is not 'done', it means polling timed out
+        if status != "done":
+            logger.error(f"Domain search for {domain} did not complete within {MAX_POLLING_ATTEMPTS} attempts.")
+            raise HTTPException(status_code=504, detail=f"Snov.io domain search timed out for {domain}. Please try again later.")
 
-async def add_prospect_to_list(prospect, email):
-    print(f"➡️ Adding to list: {email} | Position: {prospect.get('position')}")
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.snov.io/v1/prospect",
-            json={
-                "email": email,
-                "firstName": prospect.get("first_name", ""),
-                "lastName": prospect.get("last_name", ""),
-                "customFields": [{"name": "job_position", "value": prospect.get("position", "")}],
-                "listId": TARGET_LIST_ID
-            },
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        )
-        if resp.status_code != 200:
-            print(f"❌ Add prospect failed: {resp.text}")
+        # Extract prospects from the search result. 'emails' contains the prospect data.
+        prospects = domain_search_result.get("emails", [])
+        logger.info(f"Retrieved {len(prospects)} prospects for domain {domain}.")
+        checked_prospects_count = len(prospects)
 
-@app.post("/find-buyers")
-async def find_buyers(req: CompanyRequest):
-    domain_task = await start_domain_search(req.domain)
-    domain_data = await poll_domain_result(domain_task)
+        # 2. Iterate through each retrieved prospect and filter based on keywords.
+        for prospect in prospects:
+            position = prospect.get("position", "")
+            email = prospect.get("email")
+            first_name = prospect.get("firstName", "")
+            last_name = prospect.get("lastName", "")
+            # Use domain as company name if not explicitly provided by Snov.io for the prospect
+            company_name = prospect.get("companyName", domain) 
 
-    prospects_url = domain_data.get("links", {}).get("prospects")
-    if not prospects_url:
-        print("⚠️ No prospects URL found — exiting cleanly.")
-        return {"checked": 0, "added": 0}
+            if not email:
+                logger.warning(f"Skipping prospect due to missing email in Snov.io data: {prospect}")
+                continue
 
-    prospect_task = await start_prospect_search(prospects_url)
-    prospects = await poll_prospect_result(prospect_task)
+            # Check if the prospect's position contains any of the target keywords.
+            # Using re.search with '\b' for whole word matching and re.IGNORECASE for case-insensitivity.
+            is_match = any(re.search(r'\b' + re.escape(keyword) + r'\b', position, re.IGNORECASE) for keyword in TARGET_KEYWORDS)
 
-    print("🔹 Filtering for buyer-related positions...")
-    filtered = [
-        p for p in prospects
-        if p.get("position") and any(
-            kw in p["position"].lower() for kw in ["buyer", "purchase", "purchasing agent"]
-        )
-    ]
-    print(f"✅ Filtered prospects: {len(filtered)}")
+            if is_match:
+                logger.info(f"Matching prospect found: {email} (Position: '{position}'). Attempting to add to list {TARGET_LIST_ID}...")
+                # 3. Add the matching prospect to the predefined Snov.io list.
+                try:
+                    add_result = await call_snov_api(
+                        "add-prospect-to-list",
+                        {
+                            "email": email,
+                            "firstName": first_name,
+                            "lastName": last_name,
+                            "list_id": TARGET_LIST_ID,
+                            "position": position,
+                            "companyName": company_name
+                        }
+                    )
+                    if add_result.get("success"):
+                        added_prospects_count += 1
+                        logger.info(f"Successfully added {email} to list {TARGET_LIST_ID}.")
+                    else:
+                        # Log if Snov.io API explicitly indicates failure to add
+                        logger.warning(f"Failed to add {email} to list: {add_result.get('message', 'Unknown error')}")
+                except HTTPException as e:
+                    logger.error(f"API Error while adding prospect {email} to list: {e.detail}")
+                except Exception as e:
+                    logger.error(f"Unexpected error while adding prospect {email} to list: {e}")
+            else:
+                logger.info(f"Prospect {email} with position '{position}' does not match target keywords. Skipping.")
 
-    added_count = 0
-    for p in filtered:
-        email = await fetch_emails_for_prospect(p.get("search_emails_start"))
-        if email:
-            await add_prospect_to_list(p, email)
-            added_count += 1
+        logger.info(f"Finished processing domain {domain}. Summary: Checked Prospects = {checked_prospects_count}, Added Prospects = {added_prospects_count}")
+        
+        # Return the final summary of the operation
+        return {
+            "checked": checked_prospects_count,
+            "added": added_prospects_count
+        }
 
-    return {"checked": len(prospects), "added": added_count}
+    except HTTPException as e:
+        # Re-raise HTTPException to be handled by FastAPI's error handlers
+        logger.error(f"API Error processing domain {domain}: {e.detail}")
+        raise e
+    except Exception as e:
+        # Catch any unexpected critical errors and log them with traceback
+        logger.critical(f"An unhandled exception occurred while processing domain {domain}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
