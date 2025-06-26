@@ -59,7 +59,7 @@ async def start_domain_search(domain):
 
 async def poll_results(task_hash):
     async with httpx.AsyncClient() as client:
-        for attempt in range(10):
+        for attempt in range(20):  # Increased attempts
             resp = await client.get(
                 f"https://api.snov.io/v2/domain-search/result/{task_hash}",
                 headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
@@ -67,12 +67,15 @@ async def poll_results(task_hash):
             if resp.status_code != 200:
                 print("Polling failed:", resp.text)
                 raise HTTPException(status_code=500, detail="Polling failed")
+            
             data = resp.json()
             if data.get("status") == "processed":
                 print(f"Results ready after {attempt+1} attempts.")
                 return data.get("prospects", [])
-            print(f"Polling {attempt+1}/10: not ready yet")
-            await asyncio.sleep(5)
+            
+            print(f"Polling {attempt+1}/20: not ready yet")
+            print(f"Polling response: {resp.text}")
+            await asyncio.sleep(5)  # wait 5 seconds before next poll
     raise HTTPException(status_code=504, detail="Polling timed out")
 
 async def add_prospect(prospect):
