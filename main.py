@@ -33,10 +33,11 @@ async def get_access_token():
         if not ACCESS_TOKEN:
             print("No access token in response:", resp.text)
             raise HTTPException(status_code=500, detail="Access token missing")
-        print("Access token received.")
+        print("✅ Access token received.")
         return ACCESS_TOKEN
 
 async def start_domain_search(domain):
+    print(f"🔹 Starting domain search for: {domain}")
     await get_access_token()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -53,7 +54,7 @@ async def start_domain_search(domain):
             print("No task_hash received:", resp.text)
             raise HTTPException(status_code=500, detail="No task_hash received")
 
-        print("Domain search started. Task hash:", task_hash)
+        print(f"✅ Domain search task hash: {task_hash}")
         return task_hash
 
 async def poll_domain_search_result(task_hash):
@@ -68,14 +69,20 @@ async def poll_domain_search_result(task_hash):
                 raise HTTPException(status_code=500, detail="Polling domain search failed")
             
             data = resp.json()
-            if data.get("status") == "completed":
-                print(f"Domain search completed after {attempt+1} attempts.")
+            status = data.get("status")
+            print(f"🔄 Domain search poll {attempt+1}/20: status={status}")
+            meta = data.get("meta", {})
+            info = data.get("data", {})
+            print(f"ℹ️ Company: {info.get('company_name')}, Size: {info.get('size')}, Prospects: {meta.get('prospects_count')}, Emails: {meta.get('emails_count')}")
+            
+            if status == "completed":
+                print("✅ Domain search completed.")
                 return data
-            print(f"Domain search poll {attempt+1}/20: not ready yet")
             await asyncio.sleep(5)
     raise HTTPException(status_code=504, detail="Domain search polling timed out")
 
 async def start_prospect_search(prospects_url):
+    print("🔹 Starting prospect search...")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             prospects_url,
@@ -85,13 +92,12 @@ async def start_prospect_search(prospects_url):
             print(f"Prospect search start failed [{resp.status_code}]:", resp.text)
             raise HTTPException(status_code=500, detail="Prospect search start failed")
         
-        # ✅ Correctly extract task_hash from meta
         task_hash = resp.json().get("meta", {}).get("task_hash")
         if not task_hash:
             print("No task_hash for prospect search:", resp.text)
             raise HTTPException(status_code=500, detail="No task_hash for prospect search")
         
-        print("Prospect search started. Task hash:", task_hash)
+        print(f"✅ Prospect search task hash: {task_hash}")
         return task_hash
 
 async def poll_prospect_result(task_hash):
@@ -106,15 +112,19 @@ async def poll_prospect_result(task_hash):
                 raise HTTPException(status_code=500, detail="Polling prospect result failed")
             
             data = resp.json()
-            if data.get("status") == "processed":
-                print(f"Prospect search processed after {attempt+1} attempts.")
-                return data.get("prospects", [])
+            status = data.get("status")
+            print(f"🔄 Prospect search poll {attempt+1}/20: status={status}")
             
-            print(f"Prospect poll {attempt+1}/20: not ready yet")
+            if status == "processed":
+                prospects = data.get("prospects", [])
+                print(f"✅ Prospect search processed. Prospects retrieved: {len(prospects)}")
+                return prospects
+            
             await asyncio.sleep(5)
     raise HTTPException(status_code=504, detail="Prospect polling timed out")
 
 async def add_prospect(prospect):
+    print(f"➡️ Adding prospect: {prospect.get('email')} | Position: {prospect.get('position')}")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.snov.io/v1/prospect",
@@ -128,7 +138,7 @@ async def add_prospect(prospect):
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
         )
         if resp.status_code != 200:
-            print(f"Add prospect failed ({prospect.get('email')}):", resp.text)
+            print(f"❌ Failed to add: {prospect.get('email')}, Reason: {resp.text}")
 
 @app.post("/find-buyers")
 async def find_buyers(req: CompanyRequest):
@@ -143,17 +153,17 @@ async def find_buyers(req: CompanyRequest):
     # Phase 2: start and poll prospects
     prospect_task = await start_prospect_search(prospects_url)
     prospects = await poll_prospect_result(prospect_task)
-    print(f"Total prospects found: {len(prospects)}")
 
-    # Phase 3: filter + add
+    print(f"🔹 Filtering for positions matching ['buyer', 'purchase', 'purchasing agent']")
     filtered = [
         p for p in prospects
         if p.get("position") and any(
             kw in p["position"].lower() for kw in ["buyer", "purchase", "purchasing agent"]
         )
     ]
-    print(f"Filtered prospects to add: {len(filtered)}")
+    print(f"✅ Filtered prospects count: {len(filtered)}")
 
+    # Phase 3: add prospects
     for p in filtered:
         await add_prospect(p)
 
