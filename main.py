@@ -115,9 +115,9 @@ async def poll_prospect_result(task_hash):
             status = data.get("status")
             print(f"🔄 Prospect search poll {attempt+1}/20: status={status}")
             
-            if status == "processed":
+            if status == "completed":  # FIXED: status 'completed' indicates ready
                 prospects = data.get("prospects", [])
-                print(f"✅ Prospect search processed. Prospects retrieved: {len(prospects)}")
+                print(f"✅ Prospect search completed. Prospects retrieved: {len(prospects)}")
                 return prospects
             
             await asyncio.sleep(5)
