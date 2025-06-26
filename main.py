@@ -2,14 +2,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 import asyncio
-import os
 
 app = FastAPI()
 
-# Read these from Render environment variables for security
-CLIENT_ID = os.getenv("CLIENT_ID", "51f27d5e53af0dd3f31c3f254ef8faac")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET", "bc650b8ec6f50cec75385a429044e307")
-TARGET_LIST_ID = os.getenv("TARGET_LIST_ID", "31583921")
+# Your Snov.io credentials (set these securely on Render env variables ideally)
+CLIENT_ID = "6738400dc1c082262546a8f7a8b76601"
+CLIENT_SECRET = "cd413b651eda5fb2ee2bc82036313713"
+TARGET_LIST_ID = "31583921"
 
 ACCESS_TOKEN = None
 
@@ -47,12 +46,14 @@ async def start_domain_search(domain):
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
         )
         if resp.status_code != 200:
-            print("Domain search failed:", resp.text)
+            print(f"Domain search failed [{resp.status_code}]:", resp.text)
             raise HTTPException(status_code=500, detail="Domain search failed")
-        task_hash = resp.json().get("task_hash")
+        
+        task_hash = resp.json().get("meta", {}).get("task_hash")
         if not task_hash:
             print("No task_hash:", resp.text)
             raise HTTPException(status_code=500, detail="No task_hash received")
+        
         print("Domain search started. Task hash:", task_hash)
         return task_hash
 
@@ -98,7 +99,9 @@ async def find_buyers(req: CompanyRequest):
 
     filtered = [
         p for p in prospects
-        if p.get("position") and any(kw in p["position"].lower() for kw in ["buyer", "purchase", "purchasing agent"])
+        if p.get("position") and any(
+            kw in p["position"].lower() for kw in ["buyer", "purchase", "purchasing agent"]
+        )
     ]
     print(f"Filtered prospects to add: {len(filtered)}")
 
