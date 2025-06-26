@@ -62,25 +62,30 @@ async def poll_domain_result(task_hash):
             data = resp.json()
             print(f"🔄 Domain poll {attempt+1}: status={data.get('status')}")
             if data.get("status") == "completed":
-                print(f"✅ Domain search completed: Prospects={data.get('meta', {}).get('prospects_count')}")
+                print(f"✅ Domain search completed: Meta={data.get('meta')}")
+                print(f"🌐 Links: {data.get('links')}")
                 return data
             await asyncio.sleep(5)
     raise HTTPException(status_code=504, detail="Domain polling timed out")
 
 async def start_prospect_search(prospect_url):
-    print("🔹 Starting prospect search...")
+    print(f"🔹 Starting prospect search at URL: {prospect_url}")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             prospect_url,
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
         )
         if resp.status_code not in [200, 202]:
-            raise HTTPException(status_code=500, detail="Prospect search failed")
+            print("❌ Prospect search failed:", resp.text)
+            return None
         task_hash = resp.json().get("meta", {}).get("task_hash")
         print(f"✅ Prospect search task hash: {task_hash}")
         return task_hash
 
 async def poll_prospect_result(task_hash):
+    if not task_hash:
+        print("⚠️ No task hash provided for prospect polling.")
+        return []
     async with httpx.AsyncClient() as client:
         for attempt in range(20):
             resp = await client.get(
@@ -88,7 +93,8 @@ async def poll_prospect_result(task_hash):
                 headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
             )
             if resp.status_code != 200:
-                raise HTTPException(status_code=500, detail="Polling prospect result failed")
+                print("❌ Polling prospect result failed:", resp.text)
+                return []
             data = resp.json()
             print(f"🔄 Prospect poll {attempt+1}: status={data.get('status')}")
             if data.get("status") == "completed":
@@ -96,9 +102,13 @@ async def poll_prospect_result(task_hash):
                 print(f"✅ Prospects retrieved: {len(prospects)}")
                 return prospects
             await asyncio.sleep(5)
-    raise HTTPException(status_code=504, detail="Prospect polling timed out")
+    print("⚠️ Prospect polling timed out.")
+    return []
 
 async def fetch_emails_for_prospect(search_email_url):
+    if not search_email_url:
+        print("⚠️ No search email URL provided.")
+        return None
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             search_email_url,
@@ -126,7 +136,7 @@ async def fetch_emails_for_prospect(search_email_url):
                     print("⚠️ No email found.")
                     return None
             await asyncio.sleep(3)
-        print("❌ Email search timed out.")
+        print("⚠️ Email search timed out.")
         return None
 
 async def add_prospect_to_list(prospect, email):
@@ -150,9 +160,11 @@ async def add_prospect_to_list(prospect, email):
 async def find_buyers(req: CompanyRequest):
     domain_task = await start_domain_search(req.domain)
     domain_data = await poll_domain_result(domain_task)
+
     prospects_url = domain_data.get("links", {}).get("prospects")
     if not prospects_url:
-        raise HTTPException(status_code=500, detail="No prospects URL found")
+        print("⚠️ No prospects URL found — exiting cleanly.")
+        return {"checked": 0, "added": 0}
 
     prospect_task = await start_prospect_search(prospects_url)
     prospects = await poll_prospect_result(prospect_task)
@@ -168,11 +180,7 @@ async def find_buyers(req: CompanyRequest):
 
     added_count = 0
     for p in filtered:
-        email_url = p.get("search_emails_start")
-        if not email_url:
-            print("⚠️ No search_emails_start URL for prospect.")
-            continue
-        email = await fetch_emails_for_prospect(email_url)
+        email = await fetch_emails_for_prospect(p.get("search_emails_start"))
         if email:
             await add_prospect_to_list(p, email)
             added_count += 1
