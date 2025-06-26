@@ -85,7 +85,8 @@ async def start_prospect_search(prospects_url):
             print(f"Prospect search start failed [{resp.status_code}]:", resp.text)
             raise HTTPException(status_code=500, detail="Prospect search start failed")
         
-        task_hash = resp.json().get("task_hash")
+        # ✅ Correctly extract task_hash from meta
+        task_hash = resp.json().get("meta", {}).get("task_hash")
         if not task_hash:
             print("No task_hash for prospect search:", resp.text)
             raise HTTPException(status_code=500, detail="No task_hash for prospect search")
