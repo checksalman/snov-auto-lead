@@ -5,7 +5,7 @@ import asyncio
 
 app = FastAPI()
 
-# Your Snov.io credentials (set these securely on Render env variables ideally)
+# Your Snov.io credentials
 CLIENT_ID = "6738400dc1c082262546a8f7a8b76601"
 CLIENT_SECRET = "cd413b651eda5fb2ee2bc82036313713"
 TARGET_LIST_ID = "31583921"
@@ -46,14 +46,14 @@ async def start_domain_search(domain):
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
         )
         if resp.status_code != 200:
-            print(f"Domain search failed [{resp.status_code}]:", resp.text)
-            raise HTTPException(status_code=500, detail="Domain search failed")
-        
+            print(f"Domain search request failed [{resp.status_code}]:", resp.text)
+            raise HTTPException(status_code=500, detail="Domain search request failed")
+
         task_hash = resp.json().get("meta", {}).get("task_hash")
         if not task_hash:
-            print("No task_hash:", resp.text)
+            print("No task_hash received:", resp.text)
             raise HTTPException(status_code=500, detail="No task_hash received")
-        
+
         print("Domain search started. Task hash:", task_hash)
         return task_hash
 
